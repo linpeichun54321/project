@@ -1,0 +1,182 @@
+import pandas as pd
+import pyodbc
+import os
+
+# =========================
+# 📁 設定資料路徑（程式位置為基準）
+# =========================
+BASE_DIR = os.path.dirname(__file__)                # 程式所在資料夾
+DATA_DIR = os.path.join(BASE_DIR, "dataset")       # dataset 資料夾
+
+def check_file(path):
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"❌ 找不到檔案: {path}")
+
+# CSV 檔案
+csv_files = {
+    "orders": "olist_orders_dataset.csv",
+    "customers": "olist_customers_dataset.csv",
+    "order_items": "olist_order_items_dataset.csv",
+    "products": "olist_products_dataset.csv",
+    "reviews": "olist_order_reviews_dataset.csv"
+}
+
+# =========================
+# 1️⃣ 讀取原始 CSV
+# =========================
+data = {}
+for key, filename in csv_files.items():
+    file_path = os.path.join(DATA_DIR, filename)
+    check_file(file_path)
+    data[key] = pd.read_csv(file_path)
+
+orders = data["orders"]
+customers = data["customers"]
+order_items = data["order_items"]
+products = data["products"]
+reviews = data["reviews"]
+
+print("✅ 所有原始資料讀取完成")
+
+# =========================
+# 1️⃣a️⃣ 將原始 CSV 匯入 SQL Raw 表
+# =========================
+server = 'linpeichunhappy.database.windows.net'
+database = 'lin_project'
+username = 'missa'
+password = 'Cc12345678'
+driver = '{ODBC Driver 18 for SQL Server}'
+
+conn = pyodbc.connect(
+    f'DRIVER={driver};SERVER={server};DATABASE={database};UID={username};PWD={password};Encrypt=yes;TrustServerCertificate=no;Connection Timeout=30;'
+)
+cursor = conn.cursor()
+print("✅ SQL 連線成功")
+
+raw_tables = {
+    "orders": "dbo.orders_raw",
+    "customers": "dbo.customers_raw",
+    "order_items": "dbo.order_items_raw",
+    "products": "dbo.products_raw",
+    "reviews": "dbo.reviews_raw"
+}
+
+for key, table_name in raw_tables.items():
+    df = data[key]
+    for _, row in df.iterrows():
+        columns = ", ".join(df.columns)
+        placeholders = ", ".join(["?"] * len(df.columns))
+        cursor.execute(f"INSERT INTO {table_name} ({columns}) VALUES ({placeholders})", tuple(row))
+conn.commit()
+print("✅ 原始資料已寫入 SQL Raw 表")
+
+# =========================
+# 2️⃣ 清洗資料
+# =========================
+for df in [orders, customers, order_items, products, reviews]:
+    df.columns = df.columns.str.lower()
+
+# 時間欄位轉型
+orders['order_purchase_timestamp'] = pd.to_datetime(orders['order_purchase_timestamp'], errors='coerce')
+orders['order_delivered_customer_date'] = pd.to_datetime(orders['order_delivered_customer_date'], errors='coerce')
+orders['order_estimated_delivery_date'] = pd.to_datetime(orders['order_estimated_delivery_date'], errors='coerce')
+
+reviews['review_creation_date'] = pd.to_datetime(reviews['review_creation_date'], errors='coerce')
+reviews['review_answer_timestamp'] = pd.to_datetime(reviews['review_answer_timestamp'], errors='coerce')
+
+# 刪除關鍵欄位缺失
+orders = orders.dropna(subset=['order_id', 'customer_id'])
+reviews = reviews.dropna(subset=['review_id', 'order_id', 'review_score'])
+
+# 計算配送天數與是否延遲
+orders['delivery_days'] = (orders['order_delivered_customer_date'] - orders['order_purchase_timestamp']).dt.days
+orders['is_late'] = (orders['order_delivered_customer_date'] > orders['order_estimated_delivery_date']).astype(int)
+orders.loc[orders['delivery_days'] < 0, 'delivery_days'] = None
+
+# 計算評論回覆時間
+reviews['answer_days'] = (reviews['review_answer_timestamp'] - reviews['review_creation_date']).dt.days
+
+print("✅ 資料清洗完成")
+
+# =========================
+# 2️⃣a️⃣ 存清洗後 CSV + 寫入 SQL Clean 表
+# =========================
+clean_tables = {
+    "orders": "dbo.orders_clean",
+    "customers": "dbo.customers_clean",
+    "order_items": "dbo.order_items_clean",
+    "products": "dbo.products_clean",
+    "reviews": "dbo.reviews_clean"
+}
+
+for key, table_name in clean_tables.items():
+    df = eval(key)  # orders, customers, ...
+    # 存 CSV
+    file_path = os.path.join(DATA_DIR, f"{key}_clean.csv")
+    df.to_csv(file_path, index=False)
+    print(f"✅ 已存 CSV: {file_path}")
+    # 寫入 SQL
+    for _, row in df.iterrows():
+        columns = ", ".join(df.columns)
+        placeholders = ", ".join(["?"] * len(df.columns))
+        cursor.execute(f"INSERT INTO {table_name} ({columns}) VALUES ({placeholders})", tuple(row))
+conn.commit()
+print("✅ 清洗後資料已寫入 SQL Clean 表")
+
+# =========================
+# 3️⃣ 合併完整分析表
+# =========================
+orders_customers = orders.merge(customers, on='customer_id', how='left')
+order_full = order_items.merge(orders, on='order_id', how='left')
+order_full = order_full.merge(products, on='product_id', how='left')
+order_full_with_reviews = order_full.merge(reviews, on='order_id', how='left')
+
+# 存完整分析表 CSV
+full_file_path = os.path.join(DATA_DIR, "order_full_with_reviews.csv")
+order_full_with_reviews.to_csv(full_file_path, index=False)
+print(f"✅ 完整合併表已存 CSV: {full_file_path}")
+
+# 寫入 SQL Server 完整表
+for _, row in order_full_with_reviews.iterrows():
+    cursor.execute("""
+        INSERT INTO dbo.order_full_with_reviews (
+            order_id,
+            customer_id,
+            product_id,
+            seller_id,
+            price,
+            freight_value,
+            order_purchase_timestamp,
+            delivery_days,
+            is_late,
+            review_id,
+            review_score,
+            review_comment_title,
+            review_comment_message,
+            review_creation_date,
+            review_answer_timestamp,
+            answer_days
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """,
+    row['order_id'],
+    row['customer_id'],
+    row['product_id'],
+    row.get('seller_id', None),
+    row.get('price', None),
+    row.get('freight_value', None),
+    row['order_purchase_timestamp'],
+    row['delivery_days'],
+    row['is_late'],
+    row.get('review_id', None),
+    row.get('review_score', None),
+    row.get('review_comment_title', None),
+    row.get('review_comment_message', None),
+    row.get('review_creation_date', None),
+    row.get('review_answer_timestamp', None),
+    row.get('answer_days', None)
+    )
+
+conn.commit()
+conn.close()
+print("🎉 ETL 完成，三層資料已寫入 SQL Server！")
