@@ -6,7 +6,7 @@ import time
 from math import ceil
 
 # =========================
-# 資料路徑
+# 📁 路徑設定
 # =========================
 BASE_DIR = os.path.dirname(__file__)
 DATA_DIR = os.path.join(BASE_DIR, "dataset")
@@ -24,13 +24,13 @@ csv_files = {
 }
 
 # =========================
-# 讀取原始 CSV
+# 讀取 CSV
 # =========================
 data = {}
 for key, filename in csv_files.items():
-    file_path = os.path.join(DATA_DIR, filename)
-    check_file(file_path)
-    data[key] = pd.read_csv(file_path)
+    path = os.path.join(DATA_DIR, filename)
+    check_file(path)
+    data[key] = pd.read_csv(path)
 
 orders = data["orders"]
 customers = data["customers"]
@@ -41,7 +41,7 @@ reviews = data["reviews"]
 print("✅ 所有原始資料讀取完成")
 
 # =========================
-# SQL 連線
+# SQL 連線（更新版）
 # =========================
 server = 'linpeichunhappy.database.windows.net'
 database = 'lin_project'
@@ -57,57 +57,64 @@ cursor.fast_executemany = True
 print("✅ SQL 連線成功")
 
 # =========================
-# 建表函式 (全部 NVARCHAR(MAX))
+# 安全轉字串（防爆）
 # =========================
-def create_table_nvarchar(table_name, df):
-    col_defs = [f"[{col}] NVARCHAR(MAX)" for col in df.columns]
-    col_defs_str = ', '.join(col_defs)
-    table_short = table_name.split('.')[-1]
+def safe_str(x):
+    try:
+        if pd.isna(x):
+            return ""
+        if isinstance(x, (int, float)) and abs(x) > 1e18:
+            return ""
+        return str(x)
+    except:
+        return ""
+
+# =========================
+# 重建表
+# =========================
+def recreate_table(table_name, df):
+    cols = ", ".join([f"[{c}] NVARCHAR(MAX)" for c in df.columns])
     sql = f"""
-    IF NOT EXISTS (SELECT * FROM sys.tables WHERE name = '{table_short}')
-    BEGIN
-        CREATE TABLE {table_name} ({col_defs_str})
-    END
+    IF OBJECT_ID('{table_name}', 'U') IS NOT NULL
+        DROP TABLE {table_name};
+    CREATE TABLE {table_name} ({cols});
     """
     cursor.execute(sql)
     conn.commit()
 
 # =========================
-# TRUNCATE 表格
-# =========================
-def truncate_table(table_name):
-    cursor.execute(f"TRUNCATE TABLE {table_name}")
-    conn.commit()
-
-# =========================
-# 分批寫入函式 + 進度條 + 剩餘時間
+# 分批寫入
 # =========================
 def insert_dataframe(df, table_name, batch_size=5000):
-    df_str = df.fillna("").astype(str)
-    columns = ', '.join([f"[{c}]" for c in df_str.columns])
-    placeholders = ', '.join(['?'] * len(df_str.columns))
+    df = df.copy()
+    for col in df.columns:
+        df[col] = df[col].apply(safe_str)
 
-    total_rows = len(df_str)
-    total_batches = ceil(total_rows / batch_size)
+    cols = ", ".join([f"[{c}]" for c in df.columns])
+    placeholders = ", ".join(["?"] * len(df.columns))
+
+    total = len(df)
     start_time = time.time()
 
-    for i in range(total_batches):
-        batch_start = i * batch_size
-        batch_end = min((i + 1) * batch_size, total_rows)
-        batch_rows = [tuple(x) for x in df_str.iloc[batch_start:batch_end].to_numpy()]
-        cursor.executemany(f"INSERT INTO {table_name} ({columns}) VALUES ({placeholders})", batch_rows)
+    for i in range(0, total, batch_size):
+        batch = df.iloc[i:i+batch_size]
+        rows = [tuple(x) for x in batch.to_numpy()]
+        cursor.executemany(f"INSERT INTO {table_name} ({cols}) VALUES ({placeholders})", rows)
         conn.commit()
 
-        progress = (batch_end / total_rows) * 100
+        done = min(i + batch_size, total)
+        progress = done / total * 100
         elapsed = time.time() - start_time
-        remaining = elapsed / (batch_end / total_rows) - elapsed if batch_end > 0 else 0
-        remaining_str = time.strftime("%H:%M:%S", time.gmtime(remaining))
-        sys.stdout.write(f"\r📥 寫入 {table_name}: {batch_end}/{total_rows} 筆 ({progress:.1f}%), 預估剩餘時間: {remaining_str}")
+        remain = elapsed / (done/total) - elapsed if done else 0
+
+        sys.stdout.write(
+            f"\r📥 {table_name}: {done}/{total} ({progress:.1f}%) | 剩餘: {time.strftime('%H:%M:%S', time.gmtime(remain))}"
+        )
         sys.stdout.flush()
     print()
 
 # =========================
-# 寫入 Raw 表
+# 1️⃣ Raw 層
 # =========================
 raw_tables = {
     "orders": "dbo.orders_raw",
@@ -117,16 +124,15 @@ raw_tables = {
     "reviews": "dbo.reviews_raw"
 }
 
-for key, table_name in raw_tables.items():
+for key, table in raw_tables.items():
     df = data[key]
-    create_table_nvarchar(table_name, df)
-    truncate_table(table_name)  # 覆蓋舊資料
-    insert_dataframe(df, table_name)
+    recreate_table(table, df)
+    insert_dataframe(df, table)
 
-print("✅ 原始資料已寫入 SQL Raw 表")
+print("✅ Raw 完成")
 
 # =========================
-# 清洗資料
+# 2️⃣ Clean 層
 # =========================
 for df in [orders, customers, order_items, products, reviews]:
     df.columns = df.columns.str.lower()
@@ -134,23 +140,18 @@ for df in [orders, customers, order_items, products, reviews]:
 orders['order_purchase_timestamp'] = pd.to_datetime(orders['order_purchase_timestamp'], errors='coerce')
 orders['order_delivered_customer_date'] = pd.to_datetime(orders['order_delivered_customer_date'], errors='coerce')
 orders['order_estimated_delivery_date'] = pd.to_datetime(orders['order_estimated_delivery_date'], errors='coerce')
+
 reviews['review_creation_date'] = pd.to_datetime(reviews['review_creation_date'], errors='coerce')
 reviews['review_answer_timestamp'] = pd.to_datetime(reviews['review_answer_timestamp'], errors='coerce')
 
-orders = orders.dropna(subset=['order_id', 'customer_id'])
-reviews = reviews.dropna(subset=['review_id', 'order_id', 'review_score'])
+orders = orders.dropna(subset=['order_id','customer_id'])
+reviews = reviews.dropna(subset=['review_id','order_id','review_score'])
 
 orders['delivery_days'] = (orders['order_delivered_customer_date'] - orders['order_purchase_timestamp']).dt.days
 orders['is_late'] = (orders['order_delivered_customer_date'] > orders['order_estimated_delivery_date']).astype(int)
-orders.loc[orders['delivery_days'] < 0, 'delivery_days'] = None
 
 reviews['answer_days'] = (reviews['review_answer_timestamp'] - reviews['review_creation_date']).dt.days
 
-print("✅ 資料清洗完成")
-
-# =========================
-# 寫入 Clean 表 + 存 CSV
-# =========================
 clean_tables = {
     "orders": "dbo.orders_clean",
     "customers": "dbo.customers_clean",
@@ -159,33 +160,26 @@ clean_tables = {
     "reviews": "dbo.reviews_clean"
 }
 
-for key, table_name in clean_tables.items():
+for key, table in clean_tables.items():
     df = eval(key)
-    # 存 CSV
-    file_path = os.path.join(DATA_DIR, f"{key}_clean.csv")
-    df.to_csv(file_path, index=False)
-    print(f"✅ 已存 CSV: {file_path}")
-    # 建表 & 寫入 SQL
-    create_table_nvarchar(table_name, df)
-    truncate_table(table_name)
-    insert_dataframe(df, table_name)
+    df.to_csv(os.path.join(DATA_DIR, f"{key}_clean.csv"), index=False)
+    recreate_table(table, df)
+    insert_dataframe(df, table)
+
+print("✅ Clean 完成")
 
 # =========================
-# 合併完整分析表
+# 3️⃣ 合併表
 # =========================
-orders_customers = orders.merge(customers, on='customer_id', how='left')
 order_full = order_items.merge(orders, on='order_id', how='left')
 order_full = order_full.merge(products, on='product_id', how='left')
-order_full_with_reviews = order_full.merge(reviews, on='order_id', how='left')
+order_full = order_full.merge(customers, on='customer_id', how='left')
+order_full = order_full.merge(reviews, on='order_id', how='left')
 
-full_table_name = "dbo.order_full_with_reviews"
-file_path = os.path.join(DATA_DIR, "order_full_with_reviews.csv")
-order_full_with_reviews.to_csv(file_path, index=False)
-print(f"✅ 完整合併表已存 CSV: {file_path}")
+order_full.to_csv(os.path.join(DATA_DIR, "order_full.csv"), index=False)
+table = "dbo.order_full"
+recreate_table(table, order_full)
+insert_dataframe(order_full, table)
 
-create_table_nvarchar(full_table_name, order_full_with_reviews)
-truncate_table(full_table_name)
-insert_dataframe(order_full_with_reviews, full_table_name)
-
+print("🎉 ETL 三層全部完成！")
 conn.close()
-print("🎉 ETL 完整三層資料已寫入 SQL Server！")
